@@ -1,0 +1,16 @@
+# never commit secrets or local config
+.env
+.mcp.json
+*secret*
+*apikey*
+claude_desktop_config.json
+
+# generated logs & reports
+*.log
+Logs/
+Reports/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
