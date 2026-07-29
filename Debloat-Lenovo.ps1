@@ -77,7 +77,7 @@ function Get-InstalledWin32 {
       if (-not $p.DisplayName -or $p.SystemComponent -eq 1) { continue }
       $list += [pscustomobject]@{
         Name=[string]$p.DisplayName; Publisher=[string]$p.Publisher
-        SizeMB= if ($p.EstimatedSize) { [math]::Round($p.EstimatedSize/1KB,1) } else { $null }
+        SizeMB=$(if ($p.EstimatedSize) { [math]::Round($p.EstimatedSize/1KB,1) } else { $null })
         Quiet=[string]$p.QuietUninstallString; Uninstall=[string]$p.UninstallString
       }
     }

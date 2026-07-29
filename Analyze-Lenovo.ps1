@@ -49,7 +49,7 @@ function Get-InstalledWin32 {
   $list = @()
   foreach ($r in $roots) { foreach ($p in (Get-ItemProperty -Path $r -ErrorAction SilentlyContinue)) {
     if (-not $p.DisplayName -or $p.SystemComponent -eq 1) { continue }
-    $list += [pscustomobject]@{ Name=[string]$p.DisplayName; Publisher=[string]$p.Publisher; SizeMB= if ($p.EstimatedSize) { [math]::Round($p.EstimatedSize/1KB,1) } else { $null } } } }
+    $list += [pscustomobject]@{ Name=[string]$p.DisplayName; Publisher=[string]$p.Publisher; SizeMB=$(if ($p.EstimatedSize) { [math]::Round($p.EstimatedSize/1KB,1) } else { $null }) } } }
   $list | Sort-Object Name -Unique
 }
 function Get-ActiveAvNames { try { Get-CimInstance -Namespace 'root\SecurityCenter2' -ClassName AntiVirusProduct -ErrorAction Stop | ForEach-Object {
