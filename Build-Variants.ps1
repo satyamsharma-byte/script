@@ -137,7 +137,6 @@ $analyzeBody = Convert-Body $body @{
   # A read-only tool must not say "WILL BE REMOVED".
   '===== Lenovo + McAfee De-bloat' = '===== Lenovo + McAfee bloatware - ANALYSIS'
   'WILL BE REMOVED'  = 'REMOVABLE BLOAT'
-  'Will be removed :' = 'Removable bloat :'
 }
 Save-Ascii "$dir\Analyze-Lenovo.ps1" ($analyzeHeader + "`r`n" + $analyzeBody + "`r`n")
 

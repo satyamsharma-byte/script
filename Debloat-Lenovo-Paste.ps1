@@ -227,31 +227,61 @@ function Remove-Win32Program {
   @{ Success=$false; Detail=($log -join ' | ') }
 }
 
-# Startup entries + scheduled tasks that point into a folder we just emptied.
-function Remove-LeftoverStartup {
-  param([string]$Root)
-  $done = @()
-  if (-not $Root) { return $done }
-  foreach ($k in @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Run','HKLM:\Software\Microsoft\Windows\CurrentVersion\Run','HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run')) {
-    try { $p = Get-ItemProperty -Path $k -ErrorAction Stop } catch { continue }
+# Every way a program can auto-start: Run/RunOnce keys, the Startup folders
+# (shortcuts - previously invisible to this script), and scheduled tasks.
+function Get-StartupEntries {
+  $out = @()
+  $runKeys = @(
+    @{ Path='HKCU:\Software\Microsoft\Windows\CurrentVersion\Run';                  Scope='user' }
+    @{ Path='HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce';              Scope='user' }
+    @{ Path='HKLM:\Software\Microsoft\Windows\CurrentVersion\Run';                  Scope='machine' }
+    @{ Path='HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce';              Scope='machine' }
+    @{ Path='HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run';      Scope='machine' }
+    @{ Path='HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\RunOnce';  Scope='machine' }
+  )
+  foreach ($k in $runKeys) {
+    try { $p = Get-ItemProperty -Path $k.Path -ErrorAction Stop } catch { continue }
     foreach ($prop in ($p.PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' })) {
       $s = Split-CommandLine ([string]$prop.Value)
-      $file = if ($s) { $s.File } else { [string]$prop.Value }
-      if (-not (Test-UnderPath $file $Root)) { continue }
-      if ($prop.Name -match $GuardRegex) { continue }
-      try { Remove-ItemProperty -Path $k -Name $prop.Name -Force -ErrorAction Stop; $done += "Run entry '$($prop.Name)'" } catch {}
+      $out += [pscustomobject]@{ Kind='Run'; Name=$prop.Name; Target=$(if ($s) { $s.File } else { [string]$prop.Value })
+                                 Raw=[string]$prop.Value; Location=$k.Path; Scope=$k.Scope }
+    }
+  }
+  foreach ($d in @(@{ P=[Environment]::GetFolderPath('Startup'); S='user' },
+                   @{ P=[Environment]::GetFolderPath('CommonStartup'); S='machine' })) {
+    if (-not $d.P -or -not (Test-Path -LiteralPath $d.P -ErrorAction SilentlyContinue)) { continue }
+    foreach ($f in (Get-ChildItem -LiteralPath $d.P -File -ErrorAction SilentlyContinue)) {
+      $target = $f.FullName
+      if ($f.Extension -eq '.lnk') {
+        try { $target = (New-Object -ComObject WScript.Shell).CreateShortcut($f.FullName).TargetPath } catch {}
+      }
+      $out += [pscustomobject]@{ Kind='StartupFolder'; Name=$f.Name; Target=$target
+                                 Raw=$f.FullName; Location=$f.FullName; Scope=$d.S }
     }
   }
   try {
-    foreach ($t in (Get-ScheduledTask -ErrorAction Stop)) {
-      if ("$($t.TaskName) $($t.TaskPath)" -match $GuardRegex) { continue }
-      $hit = $false
-      foreach ($act in @($t.Actions)) { if ($act.Execute -and (Test-UnderPath $act.Execute $Root)) { $hit = $true } }
-      if (-not $hit) { continue }
-      try { Unregister-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -Confirm:$false -ErrorAction Stop; $done += "task '$($t.TaskName)'" } catch {}
+    foreach ($t in (Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.State -ne 'Disabled' })) {
+      $exe = ''
+      foreach ($act in @($t.Actions)) { if ($act.Execute) { $exe = [string]$act.Execute; break } }
+      $out += [pscustomobject]@{ Kind='Task'; Name=$t.TaskName; Target=($exe.Trim('"'))
+                                 Raw="$($t.TaskPath)$($t.TaskName)"; Location=$t.TaskPath; Scope='machine' }
     }
   } catch {}
-  $done
+  $out
+}
+
+function Remove-StartupEntry {
+  param($Entry)
+  try {
+    switch ($Entry.Kind) {
+      'Run'           { Remove-ItemProperty -Path $Entry.Location -Name $Entry.Name -Force -ErrorAction Stop
+                        return "removed Run entry '$($Entry.Name)'" }
+      'StartupFolder' { Remove-Item -LiteralPath $Entry.Location -Force -ErrorAction Stop
+                        return "removed startup shortcut '$($Entry.Name)'" }
+      'Task'          { Unregister-ScheduledTask -TaskName $Entry.Name -TaskPath $Entry.Location -Confirm:$false -ErrorAction Stop
+                        return "removed scheduled task '$($Entry.Name)'" }
+    }
+  } catch { return "could not remove $($Entry.Kind) '$($Entry.Name)': $($_.Exception.Message)" }
 }
 
 # Delete a leftover folder, but only inside a known vendor root and only after
@@ -388,16 +418,27 @@ try {
     }
   }
 
-  # Startup entries that belong to Lenovo/McAfee (a common slowness source).
+  # ---- Startup entries: enumerate everything, then decide one by one ----
+  $VendorRegex = '(?i)lenovo|mcafee|vantage|mirametrix|glance|webadvisor|smartconnect'
+  $startupAll = @(Get-StartupEntries)
   $startup = @()
-  foreach ($k in @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Run','HKLM:\Software\Microsoft\Windows\CurrentVersion\Run','HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run')) {
-    try { $p = Get-ItemProperty -Path $k -ErrorAction Stop } catch { continue }
-    $p.PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' } | ForEach-Object {
-      if (("$($_.Name) $($_.Value)") -match '(?i)lenovo|mcafee|vantage|mirametrix|glance') { $startup += ("Run: {0}   [{1}]" -f $_.Name, $_.Value) } }
+  foreach ($e in $startupAll) {
+    $blob = "$($e.Name) $($e.Raw) $($e.Target)"
+    if ($blob -notmatch $VendorRegex) { continue }
+    $why = $null
+    if ($blob -match $GuardRegex) {
+      $why = 'kept - protected (driver / hotkey / power / security component)'
+    } else {
+      # Belongs to something we are about to remove? Then it goes with it.
+      $owned = $false
+      foreach ($t in $targets) { foreach ($r in $t.Roots) { if (Test-UnderPath $e.Target $r) { $owned = $true } } }
+      if ($owned) { $why = 'will be removed with its program' }
+      elseif ($e.Target -and -not (Test-Path -LiteralPath $e.Target -ErrorAction SilentlyContinue)) { $why = 'will be removed - points at a file that no longer exists' }
+      else { $why = 'will be removed - vendor startup item' }
+    }
+    $startup += [pscustomobject]@{ Entry=$e; Remove=($why -notlike 'kept*'); Why=$why }
   }
-  try { Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.State -ne 'Disabled' -and ("$($_.TaskName) $($_.TaskPath)") -match '(?i)lenovo|mcafee|vantage|mirametrix' } |
-    ForEach-Object { $startup += ("Task: {0}" -f $_.TaskName) } } catch {}
-  $startup = @($startup | Sort-Object -Unique)
+  $startupRemove = @($startup | Where-Object { $_.Remove })
 
   # ---- REPORT ----
   $total = ($targets | Measure-Object SizeMB -Sum).Sum
@@ -430,18 +471,23 @@ try {
 
   Write-Host ""
   if ($startup.Count) {
-    Write-Host ("[4] RUNS AT STARTUP ({0}) - impacts boot/RAM:" -f $startup.Count) -ForegroundColor Magenta
-    $startup | ForEach-Object { Write-Host "     - $_" -ForegroundColor Magenta }
-  } else { Write-Host "[4] RUNS AT STARTUP: no Lenovo/McAfee startup entries found." -ForegroundColor Magenta }
+    Write-Host ("[4] STARTUP APPS ({0} found, {1} will be removed) - impacts boot time / RAM:" -f $startup.Count, $startupRemove.Count) -ForegroundColor Magenta
+    foreach ($s in $startup) {
+      $col = if ($s.Remove) { 'Magenta' } else { 'DarkGray' }
+      Write-Host ("     - [{0}] {1}" -f $s.Entry.Kind, $s.Entry.Name) -ForegroundColor $col
+      Write-Host ("         {0}" -f $s.Entry.Target) -ForegroundColor DarkGray
+      Write-Host ("         {0}" -f $s.Why) -ForegroundColor $col
+    }
+  } else { Write-Host "[4] STARTUP APPS: no Lenovo/McAfee startup entries found." -ForegroundColor Magenta }
 
   Write-Host ""
   Write-Host "===== SUMMARY =====" -ForegroundColor Cyan
-  Write-Host ("  Will be removed : {0} item(s), ~{1:n0} MB" -f $targets.Count, $total)
-  Write-Host ("  Kept / skipped  : {0}" -f $skipped.Count)
-  Write-Host ("  Other vendor sw : {0}" -f ($vendorOther.Count + $orphanFolders.Count))
-  Write-Host ("  Startup entries : {0}" -f $startup.Count)
+  Write-Host ("  Disk space to free    : ~{0:n0} MB   ({1} program(s)/folder(s))" -f $total, $targets.Count) -ForegroundColor Green
+  Write-Host ("  Startup apps to stop  : {0} of {1} found" -f $startupRemove.Count, $startup.Count) -ForegroundColor Green
+  Write-Host ("  Kept / skipped        : {0}" -f $skipped.Count)
+  Write-Host ("  Other vendor software : {0}" -f ($vendorOther.Count + $orphanFolders.Count))
 
-  if ($targets.Count -eq 0) { Write-Host ""; Write-Host "Nothing to remove. Done." -ForegroundColor Green; return }
+  if ($targets.Count -eq 0 -and $startupRemove.Count -eq 0) { Write-Host ""; Write-Host "Nothing to remove. Done." -ForegroundColor Green; return }
 
   # ---- ANALYZE-only ----
   if (-not $Remove) {
@@ -454,7 +500,7 @@ try {
   # ---- STEP 2: CONFIRM ----
   Write-Host ""
   if (-not $Yes) {
-    $ans = Read-Host ("Type YES (capital letters) to permanently remove these {0} item(s), ~{1:n0} MB - anything else cancels" -f $targets.Count, $total)
+    $ans = Read-Host ("Type YES (capital letters) to remove {0} program(s) (~{1:n0} MB) and {2} startup app(s) - anything else cancels" -f $targets.Count, $total, $startupRemove.Count)
     if ($ans -cne 'YES') { Write-Host "Cancelled - nothing was removed." -ForegroundColor Yellow; return }
   }
 
@@ -490,10 +536,7 @@ try {
       try { $r = Remove-LenovoService $t.Item.Service $t.Item.TaskLike; Write-Host ("   service/tasks -> {0}" -f $r); if ($r -notmatch '^nothing') { $ok=$true } } catch { Write-Host ("   service/tasks FAILED: {0}" -f $_.Exception.Message) -ForegroundColor Red }
     }
 
-    # 3e. leftovers: startup entries, tasks, and the folder itself
-    foreach ($r in $t.Roots) {
-      foreach ($d in (Remove-LeftoverStartup $r)) { Write-Host ("   removed $d") -ForegroundColor DarkGray; $ok = $true }
-    }
+    # 3e. leftovers: the folder itself (startup apps are swept together, below)
     foreach ($f in $t.Folders) {
       $r = Remove-LeftoverFolder $f
       if ($r) { Write-Host ("   $r") -ForegroundColor DarkGray; if ($r -like 'deleted*') { $ok = $true } else { $failNotes += $r } }
@@ -511,9 +554,25 @@ try {
     if ($ok) { $removed++; if ($t.SizeMB) { $freed += $t.SizeMB } } else { $failed++ }
   }
 
+  # ---- STEP 4: STARTUP APPS ----
+  # Done last, so entries belonging to a program that failed to uninstall still
+  # get switched off - the boot-time win does not depend on the uninstall.
+  $startupGone = 0
+  if ($startupRemove.Count) {
+    Write-Host ""
+    Write-Host ("Turning off {0} startup app(s) ..." -f $startupRemove.Count) -ForegroundColor Green
+    foreach ($s in $startupRemove) {
+      $r = Remove-StartupEntry $s.Entry
+      $isOk = $r -like 'removed*'
+      Write-Host ("   $r") -ForegroundColor $(if ($isOk) { 'DarkGray' } else { 'Red' })
+      if ($isOk) { $startupGone++ } else { $failNotes += $r }
+    }
+  }
+
   Write-Host ""
   Write-Host "===== REMOVAL DONE =====" -ForegroundColor Cyan
-  Write-Host ("  Removed: {0}   Failed: {1}   (~{2:n0} MB freed)" -f $removed, $failed, $freed) -ForegroundColor Green
+  Write-Host ("  Programs removed : {0}   Failed: {1}   (~{2:n0} MB freed)" -f $removed, $failed, $freed) -ForegroundColor Green
+  Write-Host ("  Startup apps off : {0} of {1}" -f $startupGone, $startupRemove.Count) -ForegroundColor Green
   if ($failNotes.Count) {
     Write-Host "  Failures:" -ForegroundColor Red
     $failNotes | ForEach-Object { Write-Host "     - $_" -ForegroundColor Red }
