@@ -72,8 +72,6 @@ $pasteHeader = @'
 #  It stops the product's own services/processes before uninstalling, runs the
 #  vendor's own silent uninstall command, and confirms by checking the registry
 #  key is gone - so "Failed" now means genuinely failed.
-#
-#  GENERATED FROM Debloat-Lenovo.ps1 BY Build-Variants.ps1 - DO NOT EDIT HERE.
 # ============================================================================
 & {
 $ErrorActionPreference = 'Stop'
@@ -91,8 +89,21 @@ $pasteBody = Convert-Body $body @{
     'Write-Host "  Re-open PowerShell as Administrator, paste this block again, and type YES." -ForegroundColor Yellow'
   'Write-Host "ANALYZE only - nothing was changed." -ForegroundColor Green' =
     'Write-Host "Report only (not Administrator) - nothing was changed." -ForegroundColor Green'
+  # Nothing in the paste block may tell the user to run a FILE - they only have
+  # the block. Every instruction has to be "paste this again".
+  'Write-Host "  Re-run without -Remove afterwards to confirm the lists are empty." -ForegroundColor DarkCyan' =
+    'Write-Host "  Paste this block again afterwards to confirm the lists are empty." -ForegroundColor DarkCyan'
 }
-Save-Ascii "$dir\Debloat-Lenovo-Paste.ps1" ($pasteHeader + "`r`n" + $pasteBody + "`r`n}`r`n")
+# The recipient of the paste block has no files - only the block. Fail the build
+# if any instruction slipped through telling them to run one.
+foreach ($banned in '.ps1', ' -Remove') {
+  if ($pasteBody.Contains($banned)) {
+    $line = ($pasteBody -split "`r?`n" | Where-Object { $_.Contains($banned) }) -join ' // '
+    throw "Paste block refers to '$banned' - it must be self-contained: $line"
+  }
+}
+$pasteFooter = "`r`n}`r`n`r`n# (generated from Debloat-Lenovo.ps1 by Build-Variants.ps1 - edit that one, not this)`r`n"
+Save-Ascii "$dir\Debloat-Lenovo-Paste.ps1" ($pasteHeader + "`r`n" + $pasteBody + $pasteFooter)
 
 # -- Analyze-Lenovo.ps1 ------------------------------------------------------
 $analyzeHeader = @'

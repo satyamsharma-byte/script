@@ -9,8 +9,6 @@
 #  It stops the product's own services/processes before uninstalling, runs the
 #  vendor's own silent uninstall command, and confirms by checking the registry
 #  key is gone - so "Failed" now means genuinely failed.
-#
-#  GENERATED FROM Debloat-Lenovo.ps1 BY Build-Variants.ps1 - DO NOT EDIT HERE.
 # ============================================================================
 & {
 $ErrorActionPreference = 'Stop'
@@ -522,7 +520,7 @@ try {
     Write-Host "  Tip: reboot and re-run - some uninstallers finish their work at boot." -ForegroundColor DarkYellow
   }
   Write-Host "  A reboot is recommended to finish any pending removals." -ForegroundColor DarkCyan
-  Write-Host "  Re-run without -Remove afterwards to confirm the lists are empty." -ForegroundColor DarkCyan
+  Write-Host "  Paste this block again afterwards to confirm the lists are empty." -ForegroundColor DarkCyan
 }
 catch {
   Write-Host ""
@@ -534,3 +532,5 @@ finally {
 }
 
 }
+
+# (generated from Debloat-Lenovo.ps1 by Build-Variants.ps1 - edit that one, not this)
