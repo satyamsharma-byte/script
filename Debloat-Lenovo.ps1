@@ -69,12 +69,19 @@ $Bloat = @(
   # Interactive=$true: confirmed on a real machine to pop its own confirmation
   # window that no silent switch suppresses. The user has to click it.
   @{ Name='Lenovo Smart Meeting / AI Meeting Manager'; Kind='both'; Interactive=$true; Patterns=@('*Smart Meeting*','*SmartMeeting*','*Meeting Manager*') }
-  @{ Name='Lenovo View / Smart Noise Cancellation / Appearance'; Kind='both'; Patterns=@('*Lenovo View*','*Smart Noise Cancellation*','*SmartAppearance*') }
+  # '*Smart Appearance*' with the space: the Store app E0469640.SmartAppearance
+  # was being removed while "Lenovo Smart Appearance Components" (151 MB, the
+  # Win32 half of the same product) sat untouched because only the space-less
+  # spelling was listed.
+  @{ Name='Lenovo View / Smart Noise Cancellation / Appearance'; Kind='both'; Patterns=@('*Lenovo View*','*Smart Noise Cancellation*','*SmartAppearance*','*Smart Appearance*') }
   @{ Name='Lenovo Voice';                   Kind='win32';Patterns=@('*Lenovo Voice*') }
   @{ Name='Lenovo WiFi Security (Coronet)'; Kind='win32';Patterns=@('*WiFi Security*','*Coronet*') }
   @{ Name='Glance by Mirametrix';           Kind='win32';Patterns=@('*Glance by Mirametrix*','*Mirametrix*') }
   @{ Name='Lenovo Quick Clean';             Kind='both'; Patterns=@('*Quick Clean*','*QuickClean*') }
-  @{ Name='Lenovo Vantage / Commercial Vantage + Vantage Service'; Kind='both'; Patterns=@('*Lenovo Vantage*','*LenovoCompanion*','*Commercial Vantage*','*LenovoSettingsforEnterprise*') }
+  # Folders: Vantage's uninstaller leaves ~40 MB behind in VantageService.
+  @{ Name='Lenovo Vantage / Commercial Vantage + Vantage Service'; Kind='both'
+     Patterns=@('*Lenovo Vantage*','*LenovoCompanion*','*Commercial Vantage*','*LenovoSettingsforEnterprise*')
+     Folders=@('%ProgramFiles(x86)%\Lenovo\VantageService','%ProgramFiles%\Lenovo\VantageService') }
   @{ Name='Lenovo Speech';                  Kind='win32';Patterns=@('*Lenovo Speech*') }
   @{ Name='Lenovo Universal Device Client (UDC)'; Kind='service'; Service='UDCService'; TaskLike='*UDC*'; Patterns=@('*Universal Device Client*') }
   @{ Name='McAfee WebAdvisor';              Kind='win32'; Interactive=$true; Patterns=@('*WebAdvisor*','*SiteAdvisor*') }
@@ -323,8 +330,28 @@ function Get-StartupEntries {
   $out
 }
 
+# Is the entry still there? The startup list is captured before anything is
+# uninstalled, and a program's own uninstaller normally takes its Run keys and
+# scheduled tasks with it. By the time we sweep, most are already gone.
+function Test-StartupEntryExists {
+  param($Entry)
+  try {
+    switch ($Entry.Kind) {
+      'Run'           { $p = Get-ItemProperty -Path $Entry.Location -ErrorAction Stop
+                        return ($null -ne $p.PSObject.Properties[$Entry.Name]) }
+      'StartupFolder' { return [bool](Test-Path -LiteralPath $Entry.Location -ErrorAction SilentlyContinue) }
+      'Task'          { return [bool](Get-ScheduledTask -TaskName $Entry.Name -TaskPath $Entry.Location -ErrorAction SilentlyContinue) }
+    }
+  } catch { return $false }
+  $false
+}
+
 function Remove-StartupEntry {
   param($Entry)
+  # Already gone means the uninstaller did our job for us. That is a success.
+  # Reporting it as a failure turned a fully successful run into "0 of 13" plus
+  # thirteen red CIM errors, which reads as a disaster to a non-technical user.
+  if (-not (Test-StartupEntryExists $Entry)) { return "already gone with its program: $($Entry.Kind) '$($Entry.Name)'" }
   try {
     switch ($Entry.Kind) {
       'Run'           { Remove-ItemProperty -Path $Entry.Location -Name $Entry.Name -Force -ErrorAction Stop
@@ -334,7 +361,11 @@ function Remove-StartupEntry {
       'Task'          { Unregister-ScheduledTask -TaskName $Entry.Name -TaskPath $Entry.Location -Confirm:$false -ErrorAction Stop
                         return "removed scheduled task '$($Entry.Name)'" }
     }
-  } catch { return "could not remove $($Entry.Kind) '$($Entry.Name)': $($_.Exception.Message)" }
+  } catch {
+    # It may have disappeared between the check and the delete.
+    if (-not (Test-StartupEntryExists $Entry)) { return "already gone with its program: $($Entry.Kind) '$($Entry.Name)'" }
+    return "could not remove $($Entry.Kind) '$($Entry.Name)': $($_.Exception.Message)"
+  }
 }
 
 # Delete a leftover folder, but only inside a known vendor root and only after
@@ -730,7 +761,7 @@ try {
     Write-Host ("Turning off {0} startup app(s) ..." -f $startupRemove.Count) -ForegroundColor Green
     foreach ($s in $startupRemove) {
       $r = Remove-StartupEntry $s.Entry
-      $isOk = $r -like 'removed*'
+      $isOk = ($r -like 'removed*') -or ($r -like 'already gone*')
       Write-Host ("   $r") -ForegroundColor $(if ($isOk) { 'DarkGray' } else { 'Red' })
       if ($isOk) { $startupGone++ } else { $failNotes += $r }
     }
