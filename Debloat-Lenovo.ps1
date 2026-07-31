@@ -63,7 +63,9 @@ $Bloat = @(
   @{ Name='Lenovo Welcome';                 Kind='win32';Patterns=@('*Lenovo Welcome*') }
   @{ Name='Lenovo Migration Assistant';     Kind='win32';Patterns=@('*Migration Assistant*') }
   @{ Name='Lenovo Family Cloud';            Kind='win32';Patterns=@('*Family Cloud*','*FamilyCloud*') }
-  @{ Name='Lenovo Smart Meeting / AI Meeting Manager'; Kind='both'; Patterns=@('*Smart Meeting*','*SmartMeeting*','*Meeting Manager*') }
+  # Interactive=$true: confirmed on a real machine to pop its own confirmation
+  # window that no silent switch suppresses. The user has to click it.
+  @{ Name='Lenovo Smart Meeting / AI Meeting Manager'; Kind='both'; Interactive=$true; Patterns=@('*Smart Meeting*','*SmartMeeting*','*Meeting Manager*') }
   @{ Name='Lenovo View / Smart Noise Cancellation / Appearance'; Kind='both'; Patterns=@('*Lenovo View*','*Smart Noise Cancellation*','*SmartAppearance*') }
   @{ Name='Lenovo Voice';                   Kind='win32';Patterns=@('*Lenovo Voice*') }
   @{ Name='Lenovo WiFi Security (Coronet)'; Kind='win32';Patterns=@('*WiFi Security*','*Coronet*') }
@@ -72,7 +74,7 @@ $Bloat = @(
   @{ Name='Lenovo Vantage / Commercial Vantage + Vantage Service'; Kind='both'; Patterns=@('*Lenovo Vantage*','*LenovoCompanion*','*Commercial Vantage*','*LenovoSettingsforEnterprise*') }
   @{ Name='Lenovo Speech';                  Kind='win32';Patterns=@('*Lenovo Speech*') }
   @{ Name='Lenovo Universal Device Client (UDC)'; Kind='service'; Service='UDCService'; TaskLike='*UDC*'; Patterns=@('*Universal Device Client*') }
-  @{ Name='McAfee WebAdvisor';              Kind='win32';Patterns=@('*WebAdvisor*','*SiteAdvisor*') }
+  @{ Name='McAfee WebAdvisor';              Kind='win32'; Interactive=$true; Patterns=@('*WebAdvisor*','*SiteAdvisor*') }
   @{ Name='McAfee Security Scan Plus';      Kind='win32';Patterns=@('*Security Scan Plus*','*Security Scan*') }
   @{ Name='McAfee Safe Connect (VPN)';      Kind='win32';Patterns=@('*Safe Connect*') }
   @{ Name='McAfee Personal Security (Store)';Kind='appx'; Patterns=@('*McAfeeSecurity*','*McAfee Personal Security*') }
@@ -262,8 +264,15 @@ function Remove-Win32Program {
   if (-not $attempts.Count) { return @{ Success=$false; Detail='no uninstall command in the registry (remove via Settings > Apps)' } }
   $log = @()
   foreach ($a in $attempts) {
-    $r = Invoke-UninstallAttempt $a $TimeoutSec
-    if ($key -and (Wait-KeyGone $key 60)) { return @{ Success=$true; Detail="$($a.Desc) -> $r, key removed" } }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $r  = Invoke-UninstallAttempt $a $TimeoutSec
+    $sw.Stop()
+    # An uninstaller that came back in a couple of seconds did nothing - it
+    # rejected the switch. Don't sit on a 60s registry poll for it; with four
+    # attempts that was three dead minutes before the one that works. A real
+    # uninstall (or one waiting on its own dialog) runs far longer than this.
+    $poll = if ($sw.Elapsed.TotalSeconds -lt 5) { 10 } else { 60 }
+    if ($key -and (Wait-KeyGone $key $poll)) { return @{ Success=$true; Detail="$($a.Desc) -> $r, key removed" } }
     $log += "$($a.Desc) -> $r"
   }
   @{ Success=$false; Detail=($log -join ' | ') }
@@ -515,6 +524,7 @@ try {
     foreach ($t in $targets) {
       $s = if ($t.SizeMB) { " (~{0:n0} MB)" -f $t.SizeMB } else { '' }
       $tag = if ($t.Item.Kind -eq 'folder') { ' [no uninstaller - folder + startup entry]' } else { '' }
+      if ($t.Item.Interactive) { $tag += ' [WILL ASK YOU TO CONFIRM IN ITS OWN WINDOW]' }
       Write-Host ("     - {0}{1}{2}" -f $t.Name, $s, $tag)
       if ($t.Live.Count) { Write-Host ("         running now (will be stopped first): {0}" -f ($t.Live -join ', ')) -ForegroundColor DarkGray }
     }
@@ -607,6 +617,22 @@ try {
   }
 
   # ---- STEP 2: CONFIRM ----
+  # Some vendors bolt a custom confirmation form onto their uninstaller that no
+  # silent switch suppresses. Two are known (see Interactive in the catalog) and
+  # others will exist, so warn unconditionally - picking "Keep" quietly defeats
+  # the whole run, and the console looks frozen until the window is answered.
+  Write-Host ""
+  $askers = @($targets | Where-Object { $_.Item.Interactive } | ForEach-Object { $_.Name })
+  Write-Host "  HEADS-UP: some uninstallers open their OWN window and ask you to confirm." -ForegroundColor Yellow
+  if ($askers.Count) {
+    Write-Host ("  On this PC, expect one from: {0}" -f ($askers -join '; ')) -ForegroundColor Yellow
+  }
+  Write-Host "  Always choose the option that CONTINUES removing, for example:" -ForegroundColor Yellow
+  Write-Host "        'No thanks, just uninstall it'    'Uninstall'    'Yes'    'Remove'" -ForegroundColor White
+  Write-Host "  Do NOT choose 'Keep web protection', 'Keep', or 'Cancel' - those leave it installed." -ForegroundColor Yellow
+  Write-Host "  While such a window is open this screen will look frozen. That is normal -" -ForegroundColor DarkGray
+  Write-Host "  answer the window and it carries on. Look behind this window if you see nothing." -ForegroundColor DarkGray
+
   Write-Host ""
   if (-not $Yes) {
     $ans = Read-Host ("Type YES (capital letters) to remove {0} program(s) (~{1:n0} MB) and {2} startup app(s) - anything else cancels" -f $targets.Count, $total, $startupRemove.Count)
