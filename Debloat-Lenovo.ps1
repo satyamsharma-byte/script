@@ -1,13 +1,23 @@
 <#
-    Debloat-Lenovo.ps1  -  Remove Lenovo + McAfee bloatware. Single self-contained
-    script. Run in an ELEVATED (Administrator) Windows PowerShell.
+    Debloat-Lenovo.ps1  -  Remove Lenovo + McAfee bloatware.
 
-    MODES
-      (default)   ANALYZE - full report of what WOULD be removed, what is kept, any
-                            other Lenovo/McAfee software, and what runs at startup.
-                            Changes nothing.
-      -Remove     REMOVE  - shows the same report, then asks you to type YES, and
-                            only then uninstalls.
+    THE ONLY FILE YOU NEED. There are no flags to remember - it decides what to
+    do from the window it is running in:
+
+      Ordinary PowerShell window   ->  CHECK ONLY. Prints a full report of what
+                                       would be cleaned up. Changes nothing.
+      Administrator window         ->  Prints the same report, then asks you to
+                                       type YES, and only then removes anything.
+
+    It works BOTH ways: paste the whole file into a PowerShell window, or save
+    it and run it as a .ps1 file. Nothing is deleted until you type YES.
+
+    HOW TO USE IT (what to tell a non-technical colleague)
+      1. Copy the whole thing.
+      2. Click Start, type PowerShell, open it, paste, press Enter.
+         -> you get a report. Nothing changes.
+      3. To clean up: open PowerShell again but right-click > Run as
+         administrator, paste the same thing, and type YES when asked.
 
     HOW REMOVAL WORKS (this is why it now succeeds where it used to fail)
       1. Stops the product's own services and processes first - an uninstaller
@@ -22,7 +32,8 @@
       5. Cleans up what the uninstaller leaves behind: startup Run entries,
          scheduled tasks, and the now-empty install folder.
 
-    FLAGS
+    OPTIONAL FLAGS (only when run as a .ps1 file - nobody needs these)
+      -CheckOnly        report even in an Administrator window, change nothing.
       -Force            allow removing McAfee even if it's the ACTIVE antivirus
                         (otherwise skipped - prefer McAfee's MCPR tool).
       -Yes              skip the "type YES" prompt AND the "Press Enter to close"
@@ -31,10 +42,6 @@
                         uninstall entry (Ready For Assistant, Warranty Viewer...).
       -TimeoutSec       per-uninstaller time limit, default 300.
 
-    HOW TO RUN (so the window does NOT close on you):
-      1. Start menu > type PowerShell > right-click > Run as administrator.
-      2. In that window:  cd "C:\path\to\folder" ; .\Debloat-Lenovo.ps1 -Remove
-
     SAFETY - never removes: drivers, power/thermal, hotkeys, touchpad, audio,
     TPM/BitLocker/biometrics, the Lenovo System Interface Foundation (ImController),
     or whatever is registered as the active antivirus. Never stops a service or
@@ -42,7 +49,7 @@
 #>
 #Requires -Version 5.1
 [CmdletBinding()]
-param([switch]$Remove, [switch]$IncludeVantage, [switch]$Force, [switch]$Yes,
+param([switch]$CheckOnly, [switch]$IncludeVantage, [switch]$Force, [switch]$Yes,
       [switch]$SkipOrphans, [int]$TimeoutSec = 300)
 
 $ErrorActionPreference = 'Stop'
@@ -385,10 +392,10 @@ function Remove-AppxByPattern {
 try {
   Write-Host ""
   Write-Host ("===== Lenovo + McAfee De-bloat  ({0}  {1}) =====" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyy-MM-dd HH:mm')) -ForegroundColor Cyan
-  if ($Remove -and -not (Test-Admin)) {
-    Write-Host "REMOVE needs administrator rights. Open PowerShell as Administrator, then re-run with -Remove." -ForegroundColor Red
-    return
-  }
+  # No flags to remember: an ordinary window checks, an Administrator window cleans.
+  $isAdmin = Test-Admin
+  $Remove  = $isAdmin -and -not $CheckOnly
+  Write-Host ("Administrator: {0}" -f $(if ($isAdmin) { 'YES' } else { 'NO' })) -ForegroundColor DarkGray
   Write-Host ""
   if ($Remove) {
     Write-Host "  *** CLEAN-UP MODE - it will ask you to type YES before anything is deleted. ***" -ForegroundColor Yellow
@@ -579,16 +586,20 @@ try {
   # ---- ANALYZE-only ----
   if (-not $Remove) {
     Write-Host ""
-    Write-Host "NOTHING WAS CHANGED. This was a read-only report." -ForegroundColor Green
+    Write-Host "NOTHING WAS CHANGED. This was a check only." -ForegroundColor Green
     Write-Host ""
-    Write-Host "  TO ACTUALLY CLEAN THIS PC:" -ForegroundColor Yellow
-    Write-Host "    1) Click Start and type:  PowerShell" -ForegroundColor Yellow
-    Write-Host "    2) Right-click 'Windows PowerShell' and choose 'Run as administrator'" -ForegroundColor Yellow
-    Write-Host "    3) Say Yes to the Windows pop-up that asks for permission" -ForegroundColor Yellow
-    Write-Host "    4) Run this again in that window" -ForegroundColor Yellow
-    Write-Host "    5) When it asks, type  YES  in capital letters and press Enter" -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "  You can stop at any point - nothing is deleted until you type YES." -ForegroundColor DarkGray
+    if ($isAdmin) {
+      Write-Host "  Check-only was requested. Run it again without -CheckOnly to clean up." -ForegroundColor Yellow
+    } else {
+      Write-Host "  TO ACTUALLY CLEAN THIS PC:" -ForegroundColor Yellow
+      Write-Host "    1) Click Start and type:  PowerShell" -ForegroundColor Yellow
+      Write-Host "    2) Right-click 'Windows PowerShell' and choose 'Run as administrator'" -ForegroundColor Yellow
+      Write-Host "    3) Say Yes to the Windows pop-up that asks for permission" -ForegroundColor Yellow
+      Write-Host "    4) Run this again in that window" -ForegroundColor Yellow
+      Write-Host "    5) When it asks, type  YES  in capital letters and press Enter" -ForegroundColor Yellow
+      Write-Host ""
+      Write-Host "  You can stop at any point - nothing is deleted until you type YES." -ForegroundColor DarkGray
+    }
     return
   }
 
@@ -674,7 +685,7 @@ try {
     Write-Host "  Tip: reboot and re-run - some uninstallers finish their work at boot." -ForegroundColor DarkYellow
   }
   Write-Host "  A reboot is recommended to finish any pending removals." -ForegroundColor DarkCyan
-  Write-Host "  Re-run without -Remove afterwards to confirm the lists are empty." -ForegroundColor DarkCyan
+  Write-Host "  Run this again afterwards to confirm the lists come back empty." -ForegroundColor DarkCyan
 }
 catch {
   Write-Host ""
