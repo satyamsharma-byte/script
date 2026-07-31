@@ -47,7 +47,10 @@
     or whatever is registered as the active antivirus. Never stops a service or
     kills a process whose name matches the protected list.
 #>
-#Requires -Version 5.1
+# NOTE: no "#Requires" line. Pasted into a console it errors with "An error
+# occurred while creating the pipeline" before anything runs, which looks like
+# a broken script to a non-technical user. The version is checked at run time
+# instead, further down.
 [CmdletBinding()]
 param([switch]$CheckOnly, [switch]$IncludeVantage, [switch]$Force, [switch]$Yes,
       [switch]$SkipOrphans, [int]$TimeoutSec = 300)
@@ -404,6 +407,10 @@ function Remove-AppxByPattern {
 try {
   Write-Host ""
   Write-Host ("===== Lenovo + McAfee De-bloat  ({0}  {1}) =====" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyy-MM-dd HH:mm')) -ForegroundColor Cyan
+  if ($PSVersionTable.PSVersion.Major -lt 5) {
+    Write-Host "This needs Windows PowerShell 5.1 or newer. Yours is $($PSVersionTable.PSVersion)." -ForegroundColor Red
+    return
+  }
   # No flags to remember: an ordinary window checks, an Administrator window cleans.
   $isAdmin = Test-Admin
   $Remove  = $isAdmin -and -not $CheckOnly
@@ -438,7 +445,12 @@ try {
   Write-Host "   - installed programs and folders ..." -ForegroundColor DarkGray
 
   # ---- STEP 1: SCAN ----
+  # $keptRoots / $keptVendorRegex: anything we deliberately KEEP must keep its
+  # startup entries too. Seen on a machine where McAfee was the active AV: the
+  # suite was correctly kept, but its McAfeeLogon task was still being switched
+  # off - crippling the very antivirus we chose to protect.
   $targets = @(); $skipped = @(); $matchedNames = @(); $claimedRoots = @()
+  $keptRoots = @(); $keptVendorRegex = $null
   foreach ($item in $Bloat) {
     $matchesW = @(); if ($item.Kind -notin @('appx','folder')) { $matchesW = @($win32 | Where-Object { Test-AnyLike $_.Name $item.Patterns }) }
     $appxNames = @()
@@ -455,16 +467,23 @@ try {
     if ($matchesW.Count -eq 0 -and $appxNames.Count -eq 0 -and -not $svcHit -and $taskHits.Count -eq 0 -and $folders.Count -eq 0) { continue }
     if ($item.Kind -eq 'folder' -and $SkipOrphans) { $skipped += "$($item.Name)  (leftover folder - skipped by -SkipOrphans)"; continue }
     $matchedNames += @($matchesW | Select-Object -Expand Name)
-    $guardHit = $null; foreach ($m in $matchesW) { if (($m.Name -match $GuardRegex) -or ([string]$m.Publisher -match $GuardRegex)) { $guardHit = $m.Name; break } }
-    if ($guardHit)                                 { $skipped += "$($item.Name)  (protected: $guardHit)"; continue }
-    if ($item.Caution -and -not $IncludeVantage)   { $skipped += "$($item.Name)  (dual-use - pass -IncludeVantage to remove)"; continue }
-    if ($item.IsAV -and -not $defenderActive -and -not $Force) {
-                                                     $skipped += "$($item.Name)  (kept - no active Windows Defender fallback; use McAfee MCPR, or -Force)"; continue }
-    # Where it lives, and what is currently running out of there.
+    # Work out where it lives BEFORE deciding, so a kept item can protect its
+    # own startup entries the same way a removed one can claim them.
     $roots = @()
     foreach ($m in $matchesW) { $r = Get-ProductRoot $m; if ($r) { $roots += $r } }
     $roots += $folders
     $roots = @($roots | Sort-Object -Unique)
+
+    $guardHit = $null; foreach ($m in $matchesW) { if (($m.Name -match $GuardRegex) -or ([string]$m.Publisher -match $GuardRegex)) { $guardHit = $m.Name; break } }
+    if ($guardHit)                                 { $skipped += "$($item.Name)  (protected: $guardHit)"; $keptRoots += $roots; continue }
+    if ($item.Caution -and -not $IncludeVantage)   { $skipped += "$($item.Name)  (dual-use - pass -IncludeVantage to remove)"; $keptRoots += $roots; continue }
+    if ($item.IsAV -and -not $defenderActive -and -not $Force) {
+                                                     $skipped += "$($item.Name)  (kept - no active Windows Defender fallback; use McAfee MCPR, or -Force)"
+                                                     $keptRoots += $roots
+                                                     # An AV scatters helpers outside its own folder (Common Files\...),
+                                                     # so protect the whole vendor by name, not just its install path.
+                                                     $keptVendorRegex = '(?i)mcafee'
+                                                     continue }
     $claimedRoots += $roots
     $live = @()
     foreach ($r in $roots) {
@@ -502,15 +521,26 @@ try {
     $blob = "$($e.Name) $($e.Raw) $($e.Target)"
     if ($blob -notmatch $VendorRegex) { continue }
     $why = $null
+    # Order matters. "Owned by something being removed" is checked before the
+    # kept-product rules, so e.g. McAfee WebAdvisor still goes even when the
+    # McAfee AV suite is being kept.
+    $owned = $false
+    foreach ($t in $targets) { foreach ($r in $t.Roots) { if (Test-UnderPath $e.Target $r) { $owned = $true } } }
+    $keptOwned = $false
+    foreach ($r in $keptRoots) { if (Test-UnderPath $e.Target $r) { $keptOwned = $true } }
+
     if ($blob -match $GuardRegex) {
       $why = 'kept - protected (driver / hotkey / power / security component)'
+    } elseif ($owned) {
+      $why = 'will be removed with its program'
+    } elseif ($keptOwned) {
+      $why = 'kept - belongs to a program we are deliberately keeping'
+    } elseif ($keptVendorRegex -and $blob -match $keptVendorRegex) {
+      $why = 'kept - belongs to your active antivirus'
+    } elseif ($e.Target -and -not (Test-Path -LiteralPath $e.Target -ErrorAction SilentlyContinue)) {
+      $why = 'will be removed - points at a file that no longer exists'
     } else {
-      # Belongs to something we are about to remove? Then it goes with it.
-      $owned = $false
-      foreach ($t in $targets) { foreach ($r in $t.Roots) { if (Test-UnderPath $e.Target $r) { $owned = $true } } }
-      if ($owned) { $why = 'will be removed with its program' }
-      elseif ($e.Target -and -not (Test-Path -LiteralPath $e.Target -ErrorAction SilentlyContinue)) { $why = 'will be removed - points at a file that no longer exists' }
-      else { $why = 'will be removed - vendor startup item' }
+      $why = 'will be removed - vendor startup item'
     }
     $startup += [pscustomobject]@{ Entry=$e; Remove=($why -notlike 'kept*'); Why=$why }
   }
@@ -563,7 +593,9 @@ try {
   Write-Host "  IN PLAIN ENGLISH - what a clean-up would do to this PC:" -ForegroundColor White
   Write-Host ""
   if ($targets.Count) {
-    Write-Host ("   *  Free about {0:n0} MB ({1:n1} GB) of disk space" -f $total, ($total/1024)) -ForegroundColor Green
+    # Only mention GB once there is a GB to mention - "(0.0 GB)" reads as broken.
+    $sizeText = if ($total -ge 1024) { "{0:n0} MB ({1:n1} GB)" -f $total, ($total/1024) } else { "{0:n0} MB" -f $total }
+    Write-Host ("   *  Free about {0} of disk space" -f $sizeText) -ForegroundColor Green
     Write-Host ("      by uninstalling {0} program(s)/leftover folder(s):" -f $targets.Count) -ForegroundColor Green
     foreach ($t in $targets) { Write-Host ("         - {0}{1}" -f $t.Name, $(if ($t.SizeMB) { " (~{0:n0} MB)" -f $t.SizeMB } else { '' })) -ForegroundColor Green }
   } else {
