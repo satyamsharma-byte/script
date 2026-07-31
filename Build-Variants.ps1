@@ -85,10 +85,10 @@ $pasteBody = Convert-Body $body @{
     '  Write-Host ("Administrator: {0}" -f $(if ($Remove) { ''YES'' } else { ''NO (report only - re-open as Administrator to remove)'' })) -ForegroundColor DarkGray'
   ) -join "`r`n"
   $holdDef = 'function Hold { }'
-  'Write-Host "To remove the [1] items, run in an elevated PowerShell:  .\Debloat-Lenovo.ps1 -Remove" -ForegroundColor Yellow' =
-    'Write-Host "  Re-open PowerShell as Administrator, paste this block again, and type YES." -ForegroundColor Yellow'
   'Write-Host "NOTHING WAS CHANGED. This was a read-only report." -ForegroundColor Green' =
-    'Write-Host "NOTHING WAS CHANGED - this window is not Administrator, so it was a report only." -ForegroundColor Green'
+    'Write-Host "NOTHING WAS CHANGED - this window is not Administrator, so it was a check only." -ForegroundColor Green'
+  "Write-Host `"    4) Run this again in that window`" -ForegroundColor Yellow" =
+    "Write-Host `"    4) Paste the same block into that window again and press Enter`" -ForegroundColor Yellow"
   # Nothing in the paste block may tell the user to run a FILE - they only have
   # the block. Every instruction has to be "paste this again".
   'Write-Host "  Re-run without -Remove afterwards to confirm the lists are empty." -ForegroundColor DarkCyan' =
@@ -132,8 +132,6 @@ $Remove = $false; $IncludeVantage = $false; $Force = $false; $Yes = $true; $Skip
 $analyzeBody = Convert-Body $body @{
   $adminGate = '  # removal is not available in the read-only variant'
   $holdDef = 'function Hold { }'
-  'Mode: {0}" -f $(if ($Remove) { ''REMOVE (will ask you to type YES before deleting)'' } else { ''ANALYZE (read-only - nothing will be changed)'' })' =
-    'Mode: {0}" -f ''ANALYZE (read-only - this script cannot remove anything)'''
   # A read-only tool must not say "WILL BE REMOVED".
   '===== Lenovo + McAfee De-bloat' = '===== Lenovo + McAfee bloatware - ANALYSIS'
   'WILL BE REMOVED'  = 'REMOVABLE BLOAT'
@@ -148,6 +146,17 @@ foreach ($f in 'Debloat-Lenovo.ps1','Debloat-Lenovo-Paste.ps1','Analyze-Lenovo.p
     Write-Host ("{0}: {1} PARSE ERROR(S)" -f $f, $err.Count) -ForegroundColor Red
     $err | ForEach-Object { Write-Host ("   L{0}: {1}" -f $_.Extent.StartLineNumber, $_.Message) -ForegroundColor Red }
   } else {
-    Write-Host ("{0}: OK ({1} lines)" -f $f, (Get-Content -LiteralPath "$dir\$f").Count) -ForegroundColor Green
+    # Paste-safety: the console submits each TOP-LEVEL statement on its own, so a
+    # trailing "finally { }" arrives with no try to attach to and errors with
+    # "The term 'finally' is not recognized". Every script here must survive
+    # being pasted, because that is how they are delivered.
+    $src = [IO.File]::ReadAllText("$dir\$f", [Text.Encoding]::UTF8)
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$null, [ref]$null)
+    $orphan = @($ast.EndBlock.Statements | Where-Object { $_.Extent.Text -match '^\s*(finally|catch|else|elseif)\b' })
+    if ($orphan.Count) {
+      Write-Host ("{0}: NOT PASTE-SAFE - orphan '{1}' block at top level" -f $f, $orphan[0].Extent.Text.Split("`n")[0].Trim()) -ForegroundColor Red
+    } else {
+      Write-Host ("{0}: OK ({1} lines, paste-safe)" -f $f, (Get-Content -LiteralPath "$dir\$f").Count) -ForegroundColor Green
+    }
   }
 }

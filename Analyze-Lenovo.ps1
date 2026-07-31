@@ -348,12 +348,22 @@ function Remove-AppxByPattern {
   if ($done) { 'removed ' + ($done -join ', ') } else { 'no matching Store package' }
 }
 
-# -- Go (everything below is wrapped so the window never closes on you) -------
+# -- Go ----------------------------------------------------------------------
+# Wrapped in & { } rather than closed with a finally block. A finally block is
+# a separate statement to the console parser, so pasting this into a PowerShell
+# window used to end with "The term 'finally' is not recognized". This form
+# survives being pasted as well as being run as a file.
+& {
 try {
   Write-Host ""
   Write-Host ("===== Lenovo + McAfee bloatware - ANALYSIS  ({0}  {1}) =====" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyy-MM-dd HH:mm')) -ForegroundColor Cyan
   # removal is not available in the read-only variant
-  Write-Host ("Mode: {0}" -f 'ANALYZE (read-only - this script cannot remove anything)') -ForegroundColor DarkGray
+  Write-Host ""
+  if ($Remove) {
+    Write-Host "  *** CLEAN-UP MODE - it will ask you to type YES before anything is deleted. ***" -ForegroundColor Yellow
+  } else {
+    Write-Host "  *** CHECK ONLY - nothing on this PC will be changed by this run. ***" -ForegroundColor Green
+  }
 
   $win32 = Get-InstalledWin32
   $activeAv = @(Get-ActiveAvNames)
@@ -409,7 +419,7 @@ try {
     $live = @()
     foreach ($r in $roots) {
       foreach ($pr in $allProcs) { $pp = $null; try { $pp = $pr.Path } catch {}; if ($pp -and (Test-UnderPath $pp $r)) { $live += $pr.Name } }
-      foreach ($sv in $allSvcs)  { if ($sv.State -eq 'Running' -and $sv.PathName -and (Test-UnderPath (Split-CommandLine $sv.PathName).File $r)) { $live += "svc:$($sv.Name)" } }
+      foreach ($sv in $allSvcs)  { if ($sv.State -eq 'Running' -and $sv.PathName -and (Test-UnderPath (Split-CommandLine $sv.PathName).File $r)) { $live += "$($sv.Name) (background service)" } }
     }
     $sz = ($matchesW | Measure-Object SizeMB -Sum).Sum
     if (-not $sz -and $folders.Count) { $sz = ($folders | ForEach-Object { Get-FolderSizeMB $_ } | Measure-Object -Sum).Sum }
@@ -539,7 +549,15 @@ try {
   if (-not $Remove) {
     Write-Host ""
     Write-Host "NOTHING WAS CHANGED. This was a read-only report." -ForegroundColor Green
-    Write-Host "To remove the [1] items, run in an elevated PowerShell:  .\Debloat-Lenovo.ps1 -Remove" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  TO ACTUALLY CLEAN THIS PC:" -ForegroundColor Yellow
+    Write-Host "    1) Click Start and type:  PowerShell" -ForegroundColor Yellow
+    Write-Host "    2) Right-click 'Windows PowerShell' and choose 'Run as administrator'" -ForegroundColor Yellow
+    Write-Host "    3) Say Yes to the Windows pop-up that asks for permission" -ForegroundColor Yellow
+    Write-Host "    4) Run this again in that window" -ForegroundColor Yellow
+    Write-Host "    5) When it asks, type  YES  in capital letters and press Enter" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  You can stop at any point - nothing is deleted until you type YES." -ForegroundColor DarkGray
     return
   }
 
@@ -632,7 +650,6 @@ catch {
   Write-Host ("ERROR: {0}" -f $_.Exception.Message) -ForegroundColor Red
   if ($_.ScriptStackTrace) { Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray }
 }
-finally {
-  Hold
 }
+Hold
 
