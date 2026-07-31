@@ -262,6 +262,7 @@ function Remove-Win32Program {
 # Every way a program can auto-start: Run/RunOnce keys, the Startup folders
 # (shortcuts - previously invisible to this script), and scheduled tasks.
 function Get-StartupEntries {
+  param($Tasks)   # pass the already-enumerated task list; re-querying is slow
   $out = @()
   $runKeys = @(
     @{ Path='HKCU:\Software\Microsoft\Windows\CurrentVersion\Run';                  Scope='user' }
@@ -291,14 +292,12 @@ function Get-StartupEntries {
                                  Raw=$f.FullName; Location=$f.FullName; Scope=$d.S }
     }
   }
-  try {
-    foreach ($t in (Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.State -ne 'Disabled' })) {
-      $exe = ''
-      foreach ($act in @($t.Actions)) { if ($act.Execute) { $exe = [string]$act.Execute; break } }
-      $out += [pscustomobject]@{ Kind='Task'; Name=$t.TaskName; Target=($exe.Trim('"'))
-                                 Raw="$($t.TaskPath)$($t.TaskName)"; Location=$t.TaskPath; Scope='machine' }
-    }
-  } catch {}
+  foreach ($t in @($Tasks | Where-Object { $_.State -ne 'Disabled' })) {
+    $exe = ''
+    try { foreach ($act in @($t.Actions)) { if ($act.Execute) { $exe = [string]$act.Execute; break } } } catch {}
+    $out += [pscustomobject]@{ Kind='Task'; Name=$t.TaskName; Target=($exe.Trim('"'))
+                               Raw="$($t.TaskPath)$($t.TaskName)"; Location=$t.TaskPath; Scope='machine' }
+  }
   $out
 }
 
@@ -394,17 +393,31 @@ try {
   if (-not $defenderActive) { try { $mp = Get-MpComputerStatus -ErrorAction Stop; if ($mp.AMRunningMode -eq 'Normal' -or ($mp.AntivirusEnabled -and $mp.RealTimeProtectionEnabled)) { $defenderActive = $true } } catch {} }
   Write-Host ("Windows Defender protecting: {0}" -f $(if ($defenderActive) { 'YES - McAfee (incl. AV suite) can be removed' } else { 'NO - McAfee AV suite will be KEPT for protection' })) -ForegroundColor DarkGray
 
+  # ---- STEP 0: collect the expensive lists ONCE ----
+  # These used to be queried inside the catalog loop, which meant enumerating
+  # every Store package and every scheduled task ~8 times over. That is what
+  # made the scan look like it had hung.
+  Write-Host ""
+  Write-Host "Scanning (about 20-60 seconds - please wait) ..." -ForegroundColor DarkCyan
+  Write-Host "   - Store apps ..." -ForegroundColor DarkGray
+  $allAppx = @(); try { $allAppx = @(Get-AppxPackage -AllUsers -ErrorAction Stop) } catch { try { $allAppx = @(Get-AppxPackage -ErrorAction Stop) } catch {} }
+  Write-Host "   - scheduled tasks ..." -ForegroundColor DarkGray
+  $allTasks = @(); try { $allTasks = @(Get-ScheduledTask -ErrorAction Stop) } catch {}
+  Write-Host "   - services and running processes ..." -ForegroundColor DarkGray
+  $allSvcs  = @(); try { $allSvcs  = @(Get-CimInstance Win32_Service -ErrorAction Stop) } catch {}
+  $allProcs = @(); try { $allProcs = @(Get-Process -ErrorAction SilentlyContinue) } catch {}
+  Write-Host "   - installed programs and folders ..." -ForegroundColor DarkGray
+
   # ---- STEP 1: SCAN ----
   $targets = @(); $skipped = @(); $matchedNames = @(); $claimedRoots = @()
   foreach ($item in $Bloat) {
     $matchesW = @(); if ($item.Kind -notin @('appx','folder')) { $matchesW = @($win32 | Where-Object { Test-AnyLike $_.Name $item.Patterns }) }
     $appxNames = @()
     if ($item.Kind -eq 'appx' -or $item.Kind -eq 'both') {
-      $pk=@(); try { $pk = Get-AppxPackage -AllUsers -ErrorAction Stop } catch { try { $pk = Get-AppxPackage -ErrorAction Stop } catch {} }
-      $appxNames = @($pk | Where-Object { $n=$_.Name; ($item.Patterns | Where-Object { $n -like $_ }) } | Select-Object -Expand Name -Unique)
+      $appxNames = @($allAppx | Where-Object { $n=$_.Name; ($item.Patterns | Where-Object { $n -like $_ }) } | Select-Object -Expand Name -Unique)
     }
     $svcHit = $null; if ($item.Service) { try { $svcHit = Get-Service -Name $item.Service -ErrorAction SilentlyContinue } catch {} }
-    $taskHits = @(); if ($item.TaskLike) { try { $taskHits = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like $item.TaskLike }) } catch {} }
+    $taskHits = @(); if ($item.TaskLike) { $taskHits = @($allTasks | Where-Object { $_.TaskName -like $item.TaskLike }) }
     $folders = @()
     if ($item.Folders) {
       $folders = @($item.Folders | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_) } |
@@ -426,8 +439,8 @@ try {
     $claimedRoots += $roots
     $live = @()
     foreach ($r in $roots) {
-      try { Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and (Test-UnderPath $_.Path $r) } | ForEach-Object { $live += $_.Name } } catch {}
-      try { Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object { $_.State -eq 'Running' -and $_.PathName -and (Test-UnderPath (Split-CommandLine $_.PathName).File $r) } | ForEach-Object { $live += "svc:$($_.Name)" } } catch {}
+      foreach ($pr in $allProcs) { $pp = $null; try { $pp = $pr.Path } catch {}; if ($pp -and (Test-UnderPath $pp $r)) { $live += $pr.Name } }
+      foreach ($sv in $allSvcs)  { if ($sv.State -eq 'Running' -and $sv.PathName -and (Test-UnderPath (Split-CommandLine $sv.PathName).File $r)) { $live += "svc:$($sv.Name)" } }
     }
     $sz = ($matchesW | Measure-Object SizeMB -Sum).Sum
     if (-not $sz -and $folders.Count) { $sz = ($folders | ForEach-Object { Get-FolderSizeMB $_ } | Measure-Object -Sum).Sum }
@@ -454,7 +467,7 @@ try {
 
   # ---- Startup entries: enumerate everything, then decide one by one ----
   $VendorRegex = '(?i)lenovo|mcafee|vantage|mirametrix|glance|webadvisor|smartconnect'
-  $startupAll = @(Get-StartupEntries)
+  $startupAll = @(Get-StartupEntries $allTasks)
   $startup = @()
   foreach ($e in $startupAll) {
     $blob = "$($e.Name) $($e.Raw) $($e.Target)"
@@ -515,18 +528,48 @@ try {
   } else { Write-Host "[4] STARTUP APPS: no Lenovo/McAfee startup entries found." -ForegroundColor Magenta }
 
   Write-Host ""
-  Write-Host "===== SUMMARY =====" -ForegroundColor Cyan
-  Write-Host ("  Disk space to free    : ~{0:n0} MB   ({1} program(s)/folder(s))" -f $total, $targets.Count) -ForegroundColor Green
-  Write-Host ("  Startup apps to stop  : {0} of {1} found" -f $startupRemove.Count, $startup.Count) -ForegroundColor Green
-  Write-Host ("  Kept / skipped        : {0}" -f $skipped.Count)
-  Write-Host ("  Other vendor software : {0}" -f ($vendorOther.Count + $orphanFolders.Count))
+  Write-Host "=========================  SUMMARY  =========================" -ForegroundColor Cyan
+  Write-Host ""
+  Write-Host "  IN PLAIN ENGLISH - what a clean-up would do to this PC:" -ForegroundColor White
+  Write-Host ""
+  if ($targets.Count) {
+    Write-Host ("   *  Free about {0:n0} MB ({1:n1} GB) of disk space" -f $total, ($total/1024)) -ForegroundColor Green
+    Write-Host ("      by uninstalling {0} program(s)/leftover folder(s):" -f $targets.Count) -ForegroundColor Green
+    foreach ($t in $targets) { Write-Host ("         - {0}{1}" -f $t.Name, $(if ($t.SizeMB) { " (~{0:n0} MB)" -f $t.SizeMB } else { '' })) -ForegroundColor Green }
+  } else {
+    Write-Host "   *  No programs need removing - nothing to free up." -ForegroundColor Green
+  }
+  Write-Host ""
+  if ($startupRemove.Count) {
+    Write-Host ("   *  Stop {0} app(s) from launching automatically at every boot" -f $startupRemove.Count) -ForegroundColor Green
+    Write-Host  "      (this is what makes the laptop feel slow after login):" -ForegroundColor Green
+    foreach ($s in $startupRemove) { Write-Host ("         - {0}  [{1}]" -f $s.Entry.Name, $s.Entry.Kind) -ForegroundColor Green }
+  } else {
+    Write-Host "   *  No startup apps need turning off." -ForegroundColor Green
+  }
+  Write-Host ""
+  $liveTotal = @($targets | ForEach-Object { $_.Live } | Where-Object { $_ } | Sort-Object -Unique)
+  if ($liveTotal.Count) {
+    Write-Host ("   *  Close {0} background process(es)/service(s) that are running right now:" -f $liveTotal.Count) -ForegroundColor DarkYellow
+    Write-Host ("         {0}" -f ($liveTotal -join ', ')) -ForegroundColor DarkYellow
+  }
+  if ($skipped.Count) {
+    Write-Host ("   *  Deliberately KEEP {0} item(s) - antivirus / dual-use / protected." -f $skipped.Count) -ForegroundColor DarkYellow
+  }
+  if (($vendorOther.Count + $orphanFolders.Count)) {
+    Write-Host ("   *  Leave {0} other Lenovo/McAfee item(s) completely untouched." -f ($vendorOther.Count + $orphanFolders.Count)) -ForegroundColor DarkYellow
+  }
+  Write-Host ""
+  Write-Host "   NEVER touched: drivers, audio, battery/thermal, Fn hotkeys, touchpad," -ForegroundColor DarkGray
+  Write-Host "   fingerprint, TPM/BitLocker, or your active antivirus." -ForegroundColor DarkGray
+  Write-Host "=============================================================" -ForegroundColor Cyan
 
-  if ($targets.Count -eq 0 -and $startupRemove.Count -eq 0) { Write-Host ""; Write-Host "Nothing to remove. Done." -ForegroundColor Green; return }
+  if ($targets.Count -eq 0 -and $startupRemove.Count -eq 0) { Write-Host ""; Write-Host "Nothing to remove. This PC is already clean." -ForegroundColor Green; return }
 
   # ---- ANALYZE-only ----
   if (-not $Remove) {
     Write-Host ""
-    Write-Host "ANALYZE only - nothing was changed." -ForegroundColor Green
+    Write-Host "NOTHING WAS CHANGED. This was a read-only report." -ForegroundColor Green
     Write-Host "To remove the [1] items, run in an elevated PowerShell:  .\Debloat-Lenovo.ps1 -Remove" -ForegroundColor Yellow
     return
   }

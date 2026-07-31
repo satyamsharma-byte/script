@@ -87,8 +87,8 @@ $pasteBody = Convert-Body $body @{
   $holdDef = 'function Hold { }'
   'Write-Host "To remove the [1] items, run in an elevated PowerShell:  .\Debloat-Lenovo.ps1 -Remove" -ForegroundColor Yellow' =
     'Write-Host "  Re-open PowerShell as Administrator, paste this block again, and type YES." -ForegroundColor Yellow'
-  'Write-Host "ANALYZE only - nothing was changed." -ForegroundColor Green' =
-    'Write-Host "Report only (not Administrator) - nothing was changed." -ForegroundColor Green'
+  'Write-Host "NOTHING WAS CHANGED. This was a read-only report." -ForegroundColor Green' =
+    'Write-Host "NOTHING WAS CHANGED - this window is not Administrator, so it was a report only." -ForegroundColor Green'
   # Nothing in the paste block may tell the user to run a FILE - they only have
   # the block. Every instruction has to be "paste this again".
   'Write-Host "  Re-run without -Remove afterwards to confirm the lists are empty." -ForegroundColor DarkCyan' =
