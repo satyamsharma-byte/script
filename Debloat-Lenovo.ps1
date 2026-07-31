@@ -91,7 +91,10 @@ $VendorRoots = @('%ProgramFiles%\Lenovo','%ProgramFiles(x86)%\Lenovo','%ProgramF
   ForEach-Object { [Environment]::ExpandEnvironmentVariables($_) } | Where-Object { $_ -notmatch '%' }
 
 # -- Helpers ----------------------------------------------------------------
-function Hold { if (-not $script:Yes -and [Environment]::UserInteractive) { Write-Host ""; Read-Host 'Press Enter to close' | Out-Null } }
+# Pause only when run as a .ps1 (so a double-clicked window stays readable).
+# $PSCommandPath is empty when the script was pasted into a console, and there
+# the pause is just a confusing extra prompt.
+function Hold { if (-not $script:Yes -and $PSCommandPath -and [Environment]::UserInteractive) { Write-Host ""; Read-Host 'Press Enter to close' | Out-Null } }
 
 function Test-Admin { try { (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) } catch { $false } }
 
