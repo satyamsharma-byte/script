@@ -87,7 +87,13 @@ $Bloat = @(
   @{ Name='McAfee WebAdvisor';              Kind='win32'; Interactive=$true; Patterns=@('*WebAdvisor*','*SiteAdvisor*') }
   @{ Name='McAfee Security Scan Plus';      Kind='win32';Patterns=@('*Security Scan Plus*','*Security Scan*') }
   @{ Name='McAfee Safe Connect (VPN)';      Kind='win32';Patterns=@('*Safe Connect*') }
-  @{ Name='McAfee Personal Security (Store)';Kind='appx'; Patterns=@('*McAfeeSecurity*','*McAfee Personal Security*') }
+  # IsAV: on current consumer stock the preinstalled McAfee is this MSIX package,
+  # and once activated it is the SecurityCenter2-registered real-time antivirus.
+  # Without IsAV the AV gate never evaluated it, so Remove-AppxPackage -AllUsers
+  # stripped the live antivirus with no -Force, no keep and no warning - and on a
+  # machine with both halves it removed the Store front-end of the very suite the
+  # script had just decided to protect.
+  @{ Name='McAfee Personal Security (Store)';Kind='appx'; IsAV=$true; Patterns=@('*McAfeeSecurity*','*McAfee Personal Security*') }
   @{ Name='McAfee LiveSafe / Total Protection (AV suite)'; Kind='win32'; IsAV=$true; Patterns=@('*McAfee LiveSafe*','*McAfee Total Protection*','*McAfee*Protection*') }
   # -- No uninstall entry in the registry: folder + startup entry only --
   @{ Name='Lenovo Ready For Assistant / SmartConnect'; Kind='folder'; Patterns=@('*Ready For*','*SmartConnect*')
@@ -113,8 +119,16 @@ function Test-Admin { try { (New-Object Security.Principal.WindowsPrincipal([Sec
 function Test-UnderPath {
   param([string]$Child,[string]$Parent)
   if (-not $Child -or -not $Parent) { return $false }
-  $c = $Child.Trim().Trim('"'); $p = $Parent.TrimEnd('\')
+  # Normalise BOTH sides. GetFullPath expands 8.3 short components, so running
+  # it on the child only meant a short-form parent (e.g. an InstallLocation of
+  # C:\PROGRA~2\Lenovo\X, or a service PathName) never matched its own folder.
+  # It failed safe in Remove-LeftoverFolder but failed UNSAFE in the startup
+  # classifier, where a miss reclassifies a kept product's entry as removable.
+  $c = $Child.Trim().Trim('"')
+  $p = $Parent.Trim().Trim('"')
   try { $c = [IO.Path]::GetFullPath($c) } catch {}
+  try { $p = [IO.Path]::GetFullPath($p) } catch {}
+  $p = $p.TrimEnd('\')
   $c.StartsWith($p + '\', [StringComparison]::OrdinalIgnoreCase) -or $c.Equals($p, [StringComparison]::OrdinalIgnoreCase)
 }
 
@@ -213,6 +227,17 @@ function Stop-ProductRuntime {
   $stopped
 }
 
+# Can Start-Process actually launch this? A full path must exist on disk; a bare
+# command name only has to resolve on PATH (rundll32.exe, cmd.exe, winget...).
+function Test-Launchable {
+  param([string]$File)
+  if (-not $File) { return $false }
+  if ($File -match '[\\/]' -or $File -match '^[A-Za-z]:') {
+    return [bool](Test-Path -LiteralPath $File -PathType Leaf -ErrorAction SilentlyContinue)
+  }
+  [bool](Get-Command -Name $File -CommandType Application -ErrorAction SilentlyContinue)
+}
+
 # Ordered list of uninstall attempts, best first.
 function Get-UninstallAttempts {
   param($p)
@@ -225,16 +250,22 @@ function Get-UninstallAttempts {
   # Split-CommandLine falls back to the first space-delimited token when it
   # cannot resolve an unquoted path, so a half-removed product whose exe is
   # already deleted yields File='C:\Program'. Launching that seven times over
-  # wastes a minute and fills the log with nonsense - require a real file.
+  # wastes a minute and fills the log with nonsense - so require something
+  # launchable. NOT a bare Test-Path: plenty of real uninstall strings invoke a
+  # command by name (rundll32.exe advpack.dll,..., cmd.exe /c ..., winget
+  # uninstall ..., powershell -c ...). Test-Path is false for all of those while
+  # Start-Process resolves them fine, so a Test-Path-only guard silently threw
+  # away every attempt for those products and then claimed the registry had no
+  # uninstall command at all.
   if ($p.Quiet) {
     $s = Split-CommandLine $p.Quiet
-    if ($s -and $s.File -and (Test-Path -LiteralPath $s.File -PathType Leaf -ErrorAction SilentlyContinue)) {
+    if ($s -and (Test-Launchable $s.File)) {
       $out += @{ Desc="quiet string: $(Split-Path $s.File -Leaf) $($s.Args)"; File=$s.File; Args=$s.Args }
     }
   }
   if ($p.Uninstall -and $p.Uninstall -notmatch '(?i)msiexec') {
     $s = Split-CommandLine $p.Uninstall
-    if ($s -and $s.File -and (Test-Path -LiteralPath $s.File -PathType Leaf -ErrorAction SilentlyContinue)) {
+    if ($s -and (Test-Launchable $s.File)) {
       $leaf = try { Split-Path $s.File -Leaf } catch { '' }
       $flagSets = @()
       if     ($leaf -match '(?i)^unins\d*\.exe$') { $flagSets = @('/VERYSILENT /SUPPRESSMSGBOXES /NORESTART','/SILENT /SUPPRESSMSGBOXES /NORESTART') }  # Inno Setup
@@ -308,10 +339,19 @@ function Get-StartupEntries {
   )
   foreach ($k in $runKeys) {
     try { $p = Get-ItemProperty -Path $k.Path -ErrorAction Stop } catch { continue }
+    $isRunOnce = $k.Path -match 'RunOnce$'
     foreach ($prop in ($p.PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' })) {
-      $s = Split-CommandLine ([string]$prop.Value)
-      $out += [pscustomobject]@{ Kind='Run'; Name=$prop.Name; Target=$(if ($s) { $s.File } else { [string]$prop.Value })
-                                 Raw=[string]$prop.Value; Location=$k.Path; Scope=$k.Scope }
+      $raw = [string]$prop.Value
+      # RunOnce values may carry a '!' (keep until the command succeeds) or '*'
+      # (also run in Safe Mode) prefix. Left in place they corrupt the parsed
+      # path to '!C:\Program', which makes the "belongs to a program we are
+      # keeping" test miss - so a protected product's entry was reclassified as
+      # removable, and the user was told the file no longer exists when it does.
+      $cmd = if ($isRunOnce) { $raw -replace '^[!*]+','' } else { $raw }
+      $s = Split-CommandLine $cmd
+      $out += [pscustomobject]@{ Kind=$(if ($isRunOnce) { 'RunOnce' } else { 'Run' }); Name=$prop.Name
+                                 Target=$(if ($s) { $s.File } else { $cmd })
+                                 Raw=$raw; Location=$k.Path; Scope=$k.Scope }
     }
   }
   foreach ($d in @(@{ P=[Environment]::GetFolderPath('Startup'); S='user' },
@@ -341,8 +381,12 @@ function Get-StartupEntries {
 function Test-StartupEntryExists {
   param($Entry)
   try {
+    # 'Run' and 'RunOnce' are both registry values - same handling, different
+    # label. Anything not matched here falls through to $false, which reads as
+    # "already gone", so every Kind emitted by Get-StartupEntries must appear.
     switch ($Entry.Kind) {
-      'Run'           { $p = Get-ItemProperty -Path $Entry.Location -ErrorAction Stop
+      { $_ -eq 'Run' -or $_ -eq 'RunOnce' } {
+                        $p = Get-ItemProperty -Path $Entry.Location -ErrorAction Stop
                         return ($null -ne $p.PSObject.Properties[$Entry.Name]) }
       'StartupFolder' { return [bool](Test-Path -LiteralPath $Entry.Location -ErrorAction SilentlyContinue) }
       'Task'          { return [bool](Get-ScheduledTask -TaskName $Entry.Name -TaskPath $Entry.Location -ErrorAction SilentlyContinue) }
@@ -359,8 +403,9 @@ function Remove-StartupEntry {
   if (-not (Test-StartupEntryExists $Entry)) { return "already gone with its program: $($Entry.Kind) '$($Entry.Name)'" }
   try {
     switch ($Entry.Kind) {
-      'Run'           { Remove-ItemProperty -Path $Entry.Location -Name $Entry.Name -Force -ErrorAction Stop
-                        return "removed Run entry '$($Entry.Name)'" }
+      { $_ -eq 'Run' -or $_ -eq 'RunOnce' } {
+                        Remove-ItemProperty -Path $Entry.Location -Name $Entry.Name -Force -ErrorAction Stop
+                        return "removed $($Entry.Kind) entry '$($Entry.Name)'" }
       'StartupFolder' { Remove-Item -LiteralPath $Entry.Location -Force -ErrorAction Stop
                         return "removed startup shortcut '$($Entry.Name)'" }
       'Task'          { Unregister-ScheduledTask -TaskName $Entry.Name -TaskPath $Entry.Location -Confirm:$false -ErrorAction Stop
@@ -413,8 +458,13 @@ function Remove-LenovoService {
     if ($svc) {
       if (($svc.DisplayName -match $GuardRegex) -or ($ServiceName -match $GuardRegex)) { return "protected service $ServiceName - kept" }
       try { Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue } catch {}
-      & sc.exe delete $ServiceName | Out-Null
-      $did += "service $ServiceName deleted"
+      # Check the exit code. sc.exe failing with ACCESS DENIED (5), DOES NOT
+      # EXIST (1060) or MARKED FOR DELETION (1072) used to be reported as
+      # "deleted" regardless, which then counted the whole product as removed.
+      $scOut = (& sc.exe delete $ServiceName 2>&1) -join ' '
+      $scCode = $LASTEXITCODE
+      if ($scCode -eq 0) { $did += "service $ServiceName deleted" }
+      else { $did += ("could NOT delete service {0} (sc.exe exit {1}: {2})" -f $ServiceName, $scCode, $scOut.Trim()) }
     }
   }
   if ($TaskLike) {
@@ -438,8 +488,14 @@ function Remove-AppxByPattern {
 # Write a transcript. Rolling this out to people who cannot diagnose their own
 # machine means "it broke my laptop" has to be answerable with a file rather
 # than a memory. Kept as its own top-level statement so it survives pasting.
-$LhcLog = Join-Path $env:TEMP ('Debloat-Lenovo-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
-try { Start-Transcript -Path $LhcLog -Force -ErrorAction Stop | Out-Null } catch { $LhcLog = $null }
+# Join-Path must be inside the try: $ErrorActionPreference is 'Stop', so an
+# empty %TEMP% threw here and killed the whole script before it ran - the
+# diagnostics feature taking down the tool it exists to diagnose.
+$LhcLog = $null
+try {
+  $tmp = $env:TEMP; if (-not $tmp) { $tmp = $env:TMP }; if (-not $tmp) { $tmp = 'C:\Windows\Temp' }
+  $LhcLog = Join-Path $tmp ('Debloat-Lenovo-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+} catch { $LhcLog = $null }
 
 # Wrapped in & { } rather than closed with a finally block. A finally block is
 # a separate statement to the console parser, so pasting this into a PowerShell
@@ -447,6 +503,15 @@ try { Start-Transcript -Path $LhcLog -Force -ErrorAction Stop | Out-Null } catch
 # survives being pasted as well as being run as a file.
 & {
 try {
+  # Transcription starts HERE, inside the block, not before it. When this file is
+  # pasted, the console echoes every line of this block as it reads it and only
+  # then executes - so starting the transcript outside meant the log captured the
+  # whole script source: 452 KB / 6,251 lines instead of a 2 KB report, burying
+  # the thing IT is supposed to read.
+  if ($LhcLog) {
+    try { Start-Transcript -Path $LhcLog -Force -ErrorAction Stop | Out-Null }
+    catch { $script:LhcLog = $null; Write-Host ("  (could not start a log file: {0})" -f $_.Exception.Message) -ForegroundColor DarkYellow }
+  }
   Write-Host ""
   Write-Host ("===== Lenovo + McAfee De-bloat  ({0}  {1}) =====" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyy-MM-dd HH:mm')) -ForegroundColor Cyan
   if ($PSVersionTable.PSVersion.Major -lt 5) {
@@ -655,7 +720,9 @@ try {
   }
   Write-Host ""
   if ($startupRemove.Count) {
-    Write-Host ("   *  Stop {0} app(s) from launching automatically at every boot" -f $startupRemove.Count) -ForegroundColor Green
+    # Not "at every boot": a RunOnce value fires at most once, and Windows
+    # deletes it itself. Saying "at every boot" was simply untrue for those.
+    Write-Host ("   *  Stop {0} app(s) from launching automatically at startup" -f $startupRemove.Count) -ForegroundColor Green
     Write-Host  "      (this is what makes the laptop feel slow after login):" -ForegroundColor Green
     foreach ($s in $startupRemove) { Write-Host ("         - {0}  [{1}]" -f $s.Entry.Name, $s.Entry.Kind) -ForegroundColor Green }
   } else {
@@ -675,10 +742,42 @@ try {
   }
   Write-Host ""
   Write-Host "   NEVER touched: drivers, audio, battery/thermal, Fn hotkeys, touchpad," -ForegroundColor DarkGray
-  Write-Host "   fingerprint, TPM/BitLocker, or your active antivirus." -ForegroundColor DarkGray
+  if ($avForceRemoved) {
+    # Do not promise the antivirus is safe on the one run where it is not.
+    Write-Host "   fingerprint, TPM/BitLocker.  (-Force IS OVERRIDING ANTIVIRUS PROTECTION)" -ForegroundColor Red
+  } else {
+    Write-Host "   fingerprint, TPM/BitLocker, or your active antivirus." -ForegroundColor DarkGray
+  }
   Write-Host "=============================================================" -ForegroundColor Cyan
 
-  if ($targets.Count -eq 0 -and $startupRemove.Count -eq 0) { Write-Host ""; Write-Host "Nothing to remove. This PC is already clean." -ForegroundColor Green; return }
+  # Printed in CHECK mode too. The banner used to sit after the check-only
+  # return, so a -Force preview listed the AV under "WILL BE REMOVED" and then
+  # promised the antivirus is never touched, with no retraction anywhere.
+  if ($avForceRemoved) {
+    Write-Host ""
+    Write-Host "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" -ForegroundColor Red
+    Write-Host "  !!  -Force WAS USED. An ANTIVIRUS PRODUCT is in the removal list.   !!" -ForegroundColor Red
+    Write-Host "  !!  Windows Defender is NOT currently protecting this PC, so after  !!" -ForegroundColor Red
+    Write-Host "  !!  this runs there may be NO real-time virus protection until      !!" -ForegroundColor Red
+    Write-Host "  !!  Defender takes over - which needs a REBOOT, and does not happen !!" -ForegroundColor Red
+    Write-Host "  !!  at all if the removal leaves remnants behind.                   !!" -ForegroundColor Red
+    Write-Host "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" -ForegroundColor Red
+  }
+
+  # Do not declare the PC clean off the back of a partial scan. Without admin,
+  # Store apps were only enumerated for the current account, so "already clean"
+  # was an absolute claim sitting a few lines under a caveat saying otherwise.
+  if ($targets.Count -eq 0 -and $startupRemove.Count -eq 0) {
+    Write-Host ""
+    if ($appxAllUsers) {
+      Write-Host "Nothing to remove. This PC is already clean." -ForegroundColor Green
+    } else {
+      Write-Host "Nothing to remove was found - but this was a limited check." -ForegroundColor Yellow
+      Write-Host "Store apps could only be checked for your own account. Re-run as" -ForegroundColor Yellow
+      Write-Host "Administrator for the complete picture." -ForegroundColor Yellow
+    }
+    return
+  }
 
   # ---- ANALYZE-only ----
   if (-not $Remove) {
@@ -706,18 +805,6 @@ try {
   # others will exist, so warn unconditionally - picking "Keep" quietly defeats
   # the whole run, and the console looks frozen until the window is answered.
   Write-Host ""
-  # -Force can strip the only live antivirus. Say so in the loudest terms the
-  # console has, before the YES prompt and again at the end.
-  if ($avForceRemoved) {
-    Write-Host "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" -ForegroundColor Red
-    Write-Host "  !!  -Force WAS USED. Your ACTIVE ANTIVIRUS is about to be removed.  !!" -ForegroundColor Red
-    Write-Host "  !!  This PC will have NO real-time virus protection afterwards      !!" -ForegroundColor Red
-    Write-Host "  !!  until Windows Defender takes over - which needs a REBOOT, and   !!" -ForegroundColor Red
-    Write-Host "  !!  does not happen at all if the removal leaves remnants behind.   !!" -ForegroundColor Red
-    Write-Host "  !!  Reboot, then check Windows Security shows Defender is ON.       !!" -ForegroundColor Red
-    Write-Host "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" -ForegroundColor Red
-    Write-Host ""
-  }
   $askers = @($targets | Where-Object { $_.Item.Interactive } | ForEach-Object { $_.Name })
   Write-Host "  HEADS-UP: some uninstallers open their OWN window and ask you to confirm." -ForegroundColor Yellow
   if ($askers.Count) {
@@ -740,7 +827,14 @@ try {
   $removed=0; $failed=0; $freed=0.0; $failNotes=@()
   foreach ($t in $targets) {
     Write-Host ("Removing {0} ..." -f $t.Name) -ForegroundColor Green
+    # $ok = did anything at all succeed. $win32Failed = a PROGRAM uninstall
+    # failed, which must veto every folder deletion for this item. They used to
+    # be one flag, so on a Kind='both' item a successful Store-app removal
+    # authorised recursively deleting the install folder of a Win32 program
+    # whose uninstall had just failed - leaving a product Windows still thinks
+    # is installed, with no files and a broken uninstaller, reported as success.
     $ok = $false
+    $win32Failed = $false
 
     # 3a. stop the product's own services + processes so files unlock
     foreach ($r in $t.Roots) {
@@ -753,8 +847,8 @@ try {
         $res = Remove-Win32Program $m $TimeoutSec
         $colour = if ($res.Success) { 'Gray' } else { 'Red' }
         Write-Host ("   program '{0}' -> {1}" -f $m.Name, $res.Detail) -ForegroundColor $colour
-        if ($res.Success) { $ok = $true } else { $failNotes += "$($m.Name): $($res.Detail)" }
-      } catch { Write-Host ("   '{0}' FAILED: {1}" -f $m.Name, $_.Exception.Message) -ForegroundColor Red; $failNotes += "$($m.Name): $($_.Exception.Message)" }
+        if ($res.Success) { $ok = $true } else { $win32Failed = $true; $failNotes += "$($m.Name): $($res.Detail)" }
+      } catch { $win32Failed = $true; Write-Host ("   '{0}' FAILED: {1}" -f $m.Name, $_.Exception.Message) -ForegroundColor Red; $failNotes += "$($m.Name): $($_.Exception.Message)" }
     }
 
     # 3c. Store apps
@@ -764,25 +858,38 @@ try {
 
     # 3d. bare services / tasks
     if ($t.Item.Kind -eq 'service') {
-      try { $r = Remove-LenovoService $t.Item.Service $t.Item.TaskLike; Write-Host ("   service/tasks -> {0}" -f $r); if ($r -notmatch '^nothing') { $ok=$true } } catch { Write-Host ("   service/tasks FAILED: {0}" -f $_.Exception.Message) -ForegroundColor Red }
+      try {
+        $r = Remove-LenovoService $t.Item.Service $t.Item.TaskLike
+        $svcBad = ($r -match 'could NOT delete')
+        Write-Host ("   service/tasks -> {0}" -f $r) -ForegroundColor $(if ($svcBad) { 'Red' } else { 'Gray' })
+        if ($svcBad) { $win32Failed = $true; $failNotes += "$($t.Name): $r" }
+        elseif ($r -notmatch '^nothing') { $ok = $true }
+      } catch { $win32Failed = $true; Write-Host ("   service/tasks FAILED: {0}" -f $_.Exception.Message) -ForegroundColor Red; $failNotes += "$($t.Name): $($_.Exception.Message)" }
     }
 
-    # 3e. leftovers: the folder itself (startup apps are swept together, below)
-    foreach ($f in $t.Folders) {
-      $r = Remove-LeftoverFolder $f
-      if ($r) { Write-Host ("   $r") -ForegroundColor DarkGray; if ($r -like 'deleted*') { $ok = $true } else { $failNotes += $r } }
-    }
-    # for uninstalled programs, sweep the now-empty install folder too
-    if ($ok -and $t.Item.Kind -ne 'folder') {
-      foreach ($r in $t.Roots) {
-        if (Test-Path -LiteralPath $r -ErrorAction SilentlyContinue) {
-          $left = Remove-LeftoverFolder $r
-          if ($left -like 'deleted*') { Write-Host ("   $left") -ForegroundColor DarkGray }
+    # 3e. leftovers: the folder itself (startup apps are swept together, below).
+    # Never delete files belonging to a program that is still registered.
+    if ($win32Failed) {
+      Write-Host "   left every folder alone - a program uninstall failed above" -ForegroundColor DarkYellow
+    } else {
+      foreach ($f in $t.Folders) {
+        $r = Remove-LeftoverFolder $f
+        if ($r) { Write-Host ("   $r") -ForegroundColor DarkGray; if ($r -like 'deleted*') { $ok = $true } else { $failNotes += $r } }
+      }
+      # for uninstalled programs, sweep the now-empty install folder too
+      if ($ok -and $t.Item.Kind -ne 'folder') {
+        foreach ($r in $t.Roots) {
+          if (Test-Path -LiteralPath $r -ErrorAction SilentlyContinue) {
+            $left = Remove-LeftoverFolder $r
+            if ($left -like 'deleted*') { Write-Host ("   $left") -ForegroundColor DarkGray }
+          }
         }
       }
     }
 
-    if ($ok) { $removed++; if ($t.SizeMB) { $freed += $t.SizeMB } } else { $failed++ }
+    # Partial success is a failure. Counting an item as removed while one of its
+    # programs is still installed is how "Failed: 0" appeared next to a failure.
+    if ($ok -and -not $win32Failed) { $removed++; if ($t.SizeMB) { $freed += $t.SizeMB } } else { $failed++ }
   }
 
   # ---- STEP 4: STARTUP APPS ----
@@ -809,11 +916,19 @@ try {
     $failNotes | ForEach-Object { Write-Host "     - $_" -ForegroundColor Red }
     Write-Host "  Tip: reboot and re-run - some uninstallers finish their work at boot." -ForegroundColor DarkYellow
   }
+  # Report what is ACTUALLY true now rather than replaying a scan-time guess.
+  # The old version printed "THIS PC MAY NOW HAVE NO ANTIVIRUS" even when the AV
+  # removal had failed and the product was still fully installed.
   if ($avForceRemoved) {
     Write-Host ""
-    Write-Host "  *** THIS PC MAY NOW HAVE NO ANTIVIRUS ***" -ForegroundColor Red
-    Write-Host "  Reboot now, then open Windows Security and confirm it says" -ForegroundColor Red
-    Write-Host "  'Microsoft Defender Antivirus is on'. If it does not, turn it on there." -ForegroundColor Red
+    $avNow = @(Get-ActiveAvNames)
+    if ($avNow.Count) {
+      Write-Host ("  Antivirus check: still protected by {0}." -f ($avNow -join ', ')) -ForegroundColor Green
+    } else {
+      Write-Host "  *** NO ACTIVE ANTIVIRUS IS REGISTERED ON THIS PC RIGHT NOW ***" -ForegroundColor Red
+      Write-Host "  Reboot now, then open Windows Security and confirm it says" -ForegroundColor Red
+      Write-Host "  'Microsoft Defender Antivirus is on'. If it does not, turn it on there." -ForegroundColor Red
+    }
   }
   Write-Host "  A reboot is recommended to finish any pending removals." -ForegroundColor DarkCyan
   Write-Host "  Run this again afterwards to confirm the lists come back empty." -ForegroundColor DarkCyan
