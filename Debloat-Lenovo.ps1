@@ -52,7 +52,7 @@
 # a broken script to a non-technical user. The version is checked at run time
 # instead, further down.
 [CmdletBinding()]
-param([switch]$CheckOnly, [switch]$IncludeVantage, [switch]$Force, [switch]$Yes,
+param([switch]$CheckOnly, [switch]$Force, [switch]$Yes,
       [switch]$SkipOrphans, [int]$TimeoutSec = 300)
 
 $ErrorActionPreference = 'Stop'
@@ -222,14 +222,19 @@ function Get-UninstallAttempts {
   if ($g.Success -and $src -match '(?i)msiexec') {
     $out += @{ Desc="msiexec /x $($g.Value) /qn"; File='msiexec.exe'; Args="/x $($g.Value) /qn /norestart" }
   }
-  # The vendor's own silent command, used exactly as written.
+  # Split-CommandLine falls back to the first space-delimited token when it
+  # cannot resolve an unquoted path, so a half-removed product whose exe is
+  # already deleted yields File='C:\Program'. Launching that seven times over
+  # wastes a minute and fills the log with nonsense - require a real file.
   if ($p.Quiet) {
     $s = Split-CommandLine $p.Quiet
-    if ($s -and $s.File) { $out += @{ Desc="quiet string: $(Split-Path $s.File -Leaf) $($s.Args)"; File=$s.File; Args=$s.Args } }
+    if ($s -and $s.File -and (Test-Path -LiteralPath $s.File -PathType Leaf -ErrorAction SilentlyContinue)) {
+      $out += @{ Desc="quiet string: $(Split-Path $s.File -Leaf) $($s.Args)"; File=$s.File; Args=$s.Args }
+    }
   }
   if ($p.Uninstall -and $p.Uninstall -notmatch '(?i)msiexec') {
     $s = Split-CommandLine $p.Uninstall
-    if ($s -and $s.File) {
+    if ($s -and $s.File -and (Test-Path -LiteralPath $s.File -PathType Leaf -ErrorAction SilentlyContinue)) {
       $leaf = try { Split-Path $s.File -Leaf } catch { '' }
       $flagSets = @()
       if     ($leaf -match '(?i)^unins\d*\.exe$') { $flagSets = @('/VERYSILENT /SUPPRESSMSGBOXES /NORESTART','/SILENT /SUPPRESSMSGBOXES /NORESTART') }  # Inno Setup
@@ -430,6 +435,12 @@ function Remove-AppxByPattern {
 }
 
 # -- Go ----------------------------------------------------------------------
+# Write a transcript. Rolling this out to people who cannot diagnose their own
+# machine means "it broke my laptop" has to be answerable with a file rather
+# than a memory. Kept as its own top-level statement so it survives pasting.
+$LhcLog = Join-Path $env:TEMP ('Debloat-Lenovo-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+try { Start-Transcript -Path $LhcLog -Force -ErrorAction Stop | Out-Null } catch { $LhcLog = $null }
+
 # Wrapped in & { } rather than closed with a finally block. A finally block is
 # a separate statement to the console parser, so pasting this into a PowerShell
 # window used to end with "The term 'finally' is not recognized". This form
@@ -465,9 +476,16 @@ try {
   # every Store package and every scheduled task ~8 times over. That is what
   # made the scan look like it had hung.
   Write-Host ""
-  Write-Host "Scanning (about 20-60 seconds - please wait) ..." -ForegroundColor DarkCyan
+  Write-Host "Scanning - this can take a minute or two on a slower PC. Please wait ..." -ForegroundColor DarkCyan
   Write-Host "   - Store apps ..." -ForegroundColor DarkGray
-  $allAppx = @(); try { $allAppx = @(Get-AppxPackage -AllUsers -ErrorAction Stop) } catch { try { $allAppx = @(Get-AppxPackage -ErrorAction Stop) } catch {} }
+  # -AllUsers needs admin. Without it we only see the current user's packages,
+  # so a non-admin check can under-count Store apps versus the admin run. Say so
+  # rather than let the two reports quietly disagree.
+  $appxAllUsers = $false
+  $allAppx = @()
+  try { $allAppx = @(Get-AppxPackage -AllUsers -ErrorAction Stop); $appxAllUsers = $true }
+  catch { try { $allAppx = @(Get-AppxPackage -ErrorAction Stop) } catch {} }
+  if (-not $appxAllUsers) { Write-Host "     (your account only - an Administrator run may find more Store apps)" -ForegroundColor DarkGray }
   Write-Host "   - scheduled tasks ..." -ForegroundColor DarkGray
   $allTasks = @(); try { $allTasks = @(Get-ScheduledTask -ErrorAction Stop) } catch {}
   Write-Host "   - services and running processes ..." -ForegroundColor DarkGray
@@ -481,7 +499,7 @@ try {
   # suite was correctly kept, but its McAfeeLogon task was still being switched
   # off - crippling the very antivirus we chose to protect.
   $targets = @(); $skipped = @(); $matchedNames = @(); $claimedRoots = @()
-  $keptRoots = @(); $keptVendorRegex = $null
+  $keptRoots = @(); $keptVendorRegex = $null; $avForceRemoved = $false
   foreach ($item in $Bloat) {
     $matchesW = @(); if ($item.Kind -notin @('appx','folder')) { $matchesW = @($win32 | Where-Object { Test-AnyLike $_.Name $item.Patterns }) }
     $appxNames = @()
@@ -507,7 +525,10 @@ try {
 
     $guardHit = $null; foreach ($m in $matchesW) { if (($m.Name -match $GuardRegex) -or ([string]$m.Publisher -match $GuardRegex)) { $guardHit = $m.Name; break } }
     if ($guardHit)                                 { $skipped += "$($item.Name)  (protected: $guardHit)"; $keptRoots += $roots; continue }
-    if ($item.Caution -and -not $IncludeVantage)   { $skipped += "$($item.Name)  (dual-use - pass -IncludeVantage to remove)"; $keptRoots += $roots; continue }
+    # Note: there is deliberately no "dual-use" gate. Vantage used to sit behind
+    # -IncludeVantage; that was decided against, so the flag and its branch are
+    # gone rather than left dangling and doing nothing.
+    if ($item.IsAV -and -not $defenderActive -and $Force) { $avForceRemoved = $true }
     if ($item.IsAV -and -not $defenderActive -and -not $Force) {
                                                      $skipped += "$($item.Name)  (kept - no active Windows Defender fallback; use McAfee MCPR, or -Force)"
                                                      $keptRoots += $roots
@@ -685,6 +706,18 @@ try {
   # others will exist, so warn unconditionally - picking "Keep" quietly defeats
   # the whole run, and the console looks frozen until the window is answered.
   Write-Host ""
+  # -Force can strip the only live antivirus. Say so in the loudest terms the
+  # console has, before the YES prompt and again at the end.
+  if ($avForceRemoved) {
+    Write-Host "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" -ForegroundColor Red
+    Write-Host "  !!  -Force WAS USED. Your ACTIVE ANTIVIRUS is about to be removed.  !!" -ForegroundColor Red
+    Write-Host "  !!  This PC will have NO real-time virus protection afterwards      !!" -ForegroundColor Red
+    Write-Host "  !!  until Windows Defender takes over - which needs a REBOOT, and   !!" -ForegroundColor Red
+    Write-Host "  !!  does not happen at all if the removal leaves remnants behind.   !!" -ForegroundColor Red
+    Write-Host "  !!  Reboot, then check Windows Security shows Defender is ON.       !!" -ForegroundColor Red
+    Write-Host "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" -ForegroundColor Red
+    Write-Host ""
+  }
   $askers = @($targets | Where-Object { $_.Item.Interactive } | ForEach-Object { $_.Name })
   Write-Host "  HEADS-UP: some uninstallers open their OWN window and ask you to confirm." -ForegroundColor Yellow
   if ($askers.Count) {
@@ -776,6 +809,12 @@ try {
     $failNotes | ForEach-Object { Write-Host "     - $_" -ForegroundColor Red }
     Write-Host "  Tip: reboot and re-run - some uninstallers finish their work at boot." -ForegroundColor DarkYellow
   }
+  if ($avForceRemoved) {
+    Write-Host ""
+    Write-Host "  *** THIS PC MAY NOW HAVE NO ANTIVIRUS ***" -ForegroundColor Red
+    Write-Host "  Reboot now, then open Windows Security and confirm it says" -ForegroundColor Red
+    Write-Host "  'Microsoft Defender Antivirus is on'. If it does not, turn it on there." -ForegroundColor Red
+  }
   Write-Host "  A reboot is recommended to finish any pending removals." -ForegroundColor DarkCyan
   Write-Host "  Run this again afterwards to confirm the lists come back empty." -ForegroundColor DarkCyan
 }
@@ -784,5 +823,11 @@ catch {
   Write-Host ("ERROR: {0}" -f $_.Exception.Message) -ForegroundColor Red
   if ($_.ScriptStackTrace) { Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray }
 }
+}
+if ($LhcLog) {
+  try { Stop-Transcript -ErrorAction Stop | Out-Null } catch {}
+  Write-Host ""
+  Write-Host ("A full log of this run was saved to:  {0}" -f $LhcLog) -ForegroundColor DarkCyan
+  Write-Host "If anything went wrong, send that file to IT." -ForegroundColor DarkCyan
 }
 Hold
